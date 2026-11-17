@@ -1,0 +1,18 @@
+# TEXTOS PARA LOS POSTS
+# Las líneas que empiezan con # se ignoran.
+# Separá cada texto con una línea que tenga solo ---
+# Se usan en orden y en ronda: post 1 = texto 1, post 2 = texto 2, ... y vuelve a empezar.
+#
+# ¿Querés un texto especial para una foto? Subí junto a la foto un .txt con el
+# MISMO nombre (ej: foto23.jpg + foto23.txt) y se usa ese en lugar de estos.
+#
+# Para TikTok, la primera línea (hasta 90 letras) va como título.
+
+Cambiá este texto por el tuyo ✨
+#tuhashtag #otrohashtag
+---
+Segundo texto de ejemplo. Escribí acá lo que quieras.
+#tuhashtag
+---
+Tercer texto de ejemplo 👇
+Guardalo para después 📌

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Publica automáticamente la próxima imagen de la carpeta `pendientes/`
-en Instagram (API oficial de Meta, gratis) y en TikTok (vía Upload-Post).
+en Instagram y TikTok. Destinos posibles (se usan los que tengan clave cargada):
+  - Buffer (plan gratis)          -> Instagram + TikTok
+  - API oficial de Meta (gratis)  -> Instagram
+  - Upload-Post (pago)            -> TikTok y otras
 
 Lo ejecuta GitHub Actions según el horario de .github/workflows/publicar.yml.
 No hace falta tocar este archivo: todo se configura con Secrets y Variables
@@ -45,6 +48,8 @@ def _env(nombre, defecto=""):
 
 
 IG_TOKEN = _env("IG_ACCESS_TOKEN")
+BUFFER_KEY = _env("BUFFER_API_KEY")
+BUFFER_REDES = [p.strip().lower() for p in _env("BUFFER_REDES", "instagram,tiktok").split(",") if p.strip()]
 UP_KEY = _env("UPLOADPOST_API_KEY")
 UP_USER = _env("UPLOADPOST_USER")
 UP_PLATAFORMAS = [p.strip().lower() for p in _env("UPLOADPOST_PLATAFORMAS", "tiktok").split(",") if p.strip()]
@@ -55,8 +60,14 @@ AVISO_POCAS = int(_env("AVISAR_CUANDO_QUEDEN", "8") or "8")
 REPO = _env("GITHUB_REPOSITORY")
 API_IG = "https://graph.instagram.com/v26.0"
 API_UP = "https://api.upload-post.com/api/upload_photos"
+API_BUFFER = "https://api.buffer.com"
 
-# Si Instagram va directo por la API de Meta, no lo mandamos también por Upload-Post.
+# Evitar publicar dos veces en la misma red:
+# prioridad Instagram -> 1) API de Meta  2) Buffer  3) Upload-Post
+#           TikTok    -> 1) Buffer       2) Upload-Post
+if IG_TOKEN and "instagram" in BUFFER_REDES:
+    BUFFER_REDES.remove("instagram")
+USAR_BUFFER = bool(BUFFER_KEY and BUFFER_REDES)
 if IG_TOKEN and "instagram" in UP_PLATAFORMAS:
     UP_PLATAFORMAS.remove("instagram")
 USAR_UPLOADPOST = bool(UP_KEY and UP_USER and UP_PLATAFORMAS)
@@ -167,15 +178,16 @@ def guardar_jpg(im, destino):
 
 
 def version_instagram(im, destino):
-    """Instagram exige JPEG, proporción entre 4:5 y 1.91:1 y 320–1440 px de ancho."""
+    """Instagram exige JPEG, proporción entre 4:5 y 1.91:1 y 320–1440 px de ancho.
+    Usamos 1080 de ancho máximo: es lo que recomienda Instagram y TikTok no acepta más de 1080p."""
     w, h = im.size
     r = w / h
     if r < 0.8:  # muy vertical (ej. 9:16) -> lienzo 4:5 sin recortar
         im = _con_fondo(im, round(h * 0.8), h)
     elif r > 1.91:  # muy horizontal -> lienzo 1.91:1
         im = _con_fondo(im, w, round(w / 1.91))
-    if im.width > 1440:
-        im = im.resize((1440, round(im.height * 1440 / im.width)), Image.LANCZOS)
+    if im.width > 1080:
+        im = im.resize((1080, round(im.height * 1080 / im.width)), Image.LANCZOS)
     if im.width < 320:
         im = im.resize((320, round(im.height * 320 / im.width)), Image.LANCZOS)
     guardar_jpg(im, destino)
@@ -280,17 +292,101 @@ def uploadpost_publicar(archivo, caption):
     return "OK"
 
 
+# ---------------------------------------------------------------- Buffer (gratis: Instagram + TikTok)
+CREAR_POST = """
+mutation CreatePost($input: CreatePostInput!) {
+  createPost(input: $input) {
+    __typename
+    ... on PostActionSuccess { post { id status } }
+    ... on MutationError { message }
+  }
+}"""
+
+
+def buffer_gql(query, variables=None):
+    r = requests.post(
+        API_BUFFER,
+        headers={
+            "Authorization": f"Bearer {BUFFER_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (publicador-automatico)",
+        },
+        json={"query": query, "variables": variables or {}},
+        timeout=60,
+    )
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"errors": [{"message": r.text[:300]}]}
+
+
+def buffer_canales():
+    """Devuelve los canales de Buffer (Instagram/TikTok) donde hay que publicar."""
+    codigo, datos = buffer_gql("query { account { organizations { id name } } }")
+    orgs = (((datos or {}).get("data") or {}).get("account") or {}).get("organizations") or []
+    if codigo != 200 or not orgs:
+        raise RuntimeError(f"La clave de Buffer no funciona. Respuesta ({codigo}): {datos}")
+    canales = []
+    for org in orgs:
+        codigo, datos = buffer_gql(
+            "query($o: OrganizationId!) { channels(input: {organizationId: $o}) { id name service isQueuePaused } }",
+            {"o": org["id"]},
+        )
+        if "errors" in datos:  # por si el tipo del parámetro cambia de nombre
+            codigo, datos = buffer_gql(
+                'query { channels(input: {organizationId: "%s"}) { id name service isQueuePaused } }' % org["id"]
+            )
+        for c in ((datos.get("data") or {}).get("channels") or []):
+            servicio = (c.get("service") or "").lower()
+            if servicio in BUFFER_REDES and not c.get("isQueuePaused"):
+                canales.append(c)
+    if not canales:
+        raise RuntimeError(f"No encontré canales de {', '.join(BUFFER_REDES)} conectados en Buffer (o tienen la cola pausada).")
+    log("Buffer conectado: " + ", ".join(f"{c['service']} ({c['name']})" for c in canales))
+    return canales
+
+
+def buffer_publicar(canales, url, caption):
+    resultados, errores = [], []
+    for canal in canales:
+        servicio = canal["service"].lower()
+        base = {"channelId": canal["id"], "text": caption, "schedulingType": "automatic",
+                "assets": [{"image": {"url": url}}]}
+        meta = {"instagram": {"type": "post", "shouldShareToFeed": True}} if servicio == "instagram" else None
+        en_2_min = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Probamos primero "publicar ya"; si la API no acepta alguna opción, vamos con variantes más simples.
+        variantes = []
+        for modo in ({"mode": "shareNow"}, {"mode": "customScheduled", "dueAt": en_2_min}):
+            if meta:
+                variantes.append({**base, **modo, "metadata": meta})
+            variantes.append({**base, **modo})
+        ultimo = None
+        for entrada in variantes:
+            codigo, datos = buffer_gql(CREAR_POST, {"input": entrada})
+            res = (datos.get("data") or {}).get("createPost") or {}
+            if res.get("__typename") == "PostActionSuccess":
+                resultados.append(f"{servicio} OK")
+                log(f"Buffer {servicio}: OK ({entrada['mode']}) post {res['post']['id']}")
+                break
+            ultimo = res.get("message") or datos.get("errors") or datos
+            log(f"Buffer {servicio}: intento sin éxito -> {ultimo}")
+        else:
+            resultados.append(f"{servicio} ERROR")
+            errores.append(f"Buffer {servicio} falló: {ultimo}")
+    return " | ".join(resultados), errores
+
+
 # ---------------------------------------------------------------- flujo principal
 def registrar(fila):
     nuevo = not REGISTRO.exists()
     with open(REGISTRO, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if nuevo:
-            w.writerow(["fecha_utc", "archivo", "instagram", "uploadpost"])
+            w.writerow(["fecha_utc", "archivo", "instagram_directo", "buffer", "uploadpost"])
         w.writerow(fila)
 
 
-def publicar_una(estado, ig_id):
+def publicar_una(estado, ig_id, canales_buffer=None):
     pendientes = imagenes_pendientes()
     if not pendientes:
         return None
@@ -334,7 +430,7 @@ def publicar_una(estado, ig_id):
         f"https://raw.githubusercontent.com/{REPO}/{sha}/{ruta}",
     ]
 
-    resultado_ig = resultado_up = "-"
+    resultado_ig = resultado_bf = resultado_up = "-"
     errores = []
     if ig_id:
         try:
@@ -344,6 +440,19 @@ def publicar_una(estado, ig_id):
             resultado_ig = "ERROR"
             errores.append(str(e))
             error(str(e))
+    if canales_buffer:
+        if MODO_PRUEBA:
+            resultado_bf = "PRUEBA"
+        else:
+            try:
+                resultado_bf, errs = buffer_publicar(canales_buffer, urls[0], caption)
+                errores += errs
+                for e in errs:
+                    error(e)
+            except Exception as e:
+                resultado_bf = "ERROR"
+                errores.append(str(e))
+                error(str(e))
     if USAR_UPLOADPOST:
         try:
             resultado_up = "PRUEBA" if MODO_PRUEBA else uploadpost_publicar(tmp_tiktok, caption)
@@ -353,7 +462,7 @@ def publicar_una(estado, ig_id):
             errores.append(str(e))
             error(str(e))
 
-    algo_salio = "OK" in resultado_ig or "OK" in resultado_up or MODO_PRUEBA
+    algo_salio = any("OK" in r for r in (resultado_ig, resultado_bf, resultado_up)) or MODO_PRUEBA
     base = original.stem.removeprefix("000_reintento_")
     fallos = estado.setdefault("fallos", {})
     if algo_salio:
@@ -375,33 +484,49 @@ def publicar_una(estado, ig_id):
                 nuevo.with_suffix(".txt").write_text(caption, encoding="utf-8")
             aviso(f"{original.name} no se pudo publicar; se reintenta en la próxima ejecución")
 
-    registrar([dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), original.name, resultado_ig, resultado_up])
+    registrar([dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), original.name, resultado_ig, resultado_bf, resultado_up])
     escribir_estado(estado)
-    guardar_en_repo(f"Publicada {original.name} (IG: {resultado_ig.split()[0]}, otras: {resultado_up})")
+    guardar_en_repo(f"Publicada {original.name} (IG directo: {resultado_ig.split()[0]}, Buffer: {resultado_bf}, Upload-Post: {resultado_up})")
     return errores
 
 
 def main():
-    if not IG_TOKEN and not USAR_UPLOADPOST:
-        error("No hay ningún destino configurado. Cargá el secret IG_ACCESS_TOKEN y/o UPLOADPOST_API_KEY + UPLOADPOST_USER.")
+    global USAR_UPLOADPOST
+    if not IG_TOKEN and not USAR_BUFFER and not USAR_UPLOADPOST:
+        error("No hay ningún destino configurado. Cargá el secret BUFFER_API_KEY (gratis), "
+              "o IG_ACCESS_TOKEN, o UPLOADPOST_API_KEY + UPLOADPOST_USER. Ver README.")
         return 1
 
-    # Verificamos el token ANTES de tocar las imágenes, así un token vencido no gasta fotos.
+    # Verificamos las claves ANTES de tocar las imágenes, así una clave vencida no gasta fotos.
+    canales_buffer = None
+    if USAR_BUFFER:
+        try:
+            canales_buffer = ([{"id": "x", "name": "prueba", "service": s} for s in BUFFER_REDES]
+                              if MODO_PRUEBA else buffer_canales())
+            cubiertas = {c["service"].lower() for c in canales_buffer}
+            for red in cubiertas & set(UP_PLATAFORMAS):
+                UP_PLATAFORMAS.remove(red)  # ya sale por Buffer
+            USAR_UPLOADPOST = bool(UP_KEY and UP_USER and UP_PLATAFORMAS)
+        except Exception as e:
+            error(str(e))
+            if not IG_TOKEN and not USAR_UPLOADPOST:
+                return 1
+
     ig_id = None
     if IG_TOKEN:
         try:
             ig_id = "PRUEBA" if MODO_PRUEBA else ig_verificar()
         except Exception as e:
             error(str(e))
-            if not USAR_UPLOADPOST:
+            if not canales_buffer and not USAR_UPLOADPOST:
                 return 1
-            aviso("Sigo solo con Upload-Post.")
+            aviso("Sigo con los otros destinos.")
 
     estado = leer_estado()
     todos_errores = []
     publicadas = 0
     for _ in range(POR_EJECUCION):
-        errores = publicar_una(estado, ig_id)
+        errores = publicar_una(estado, ig_id, canales_buffer)
         if errores is None:
             break
         publicadas += 1
